@@ -24,11 +24,12 @@ import os
 import shutil
 import statistics
 import time
+import uuid
 from pathlib import Path
 
 from . import BenchError
 from .agent import parse_tokens, resolve_agent_program, run_agent, run_script
-from .task import Task
+from .task import MAX_TIMEOUT_S, Task
 
 
 def _median(values: list) -> float | int | None:
@@ -43,8 +44,7 @@ def _median(values: list) -> float | int | None:
 def summarize_runs(runs: list[dict]) -> dict:
     """Aggregate one arm's runs: pass rate, token / wall medians, count."""
     if not runs:
-        return {"pass_rate": 0.0, "tokens_median": None,
-                "wall_median_s": None, "runs": 0}
+        return {"pass_rate": 0.0, "tokens_median": None, "wall_median_s": None, "runs": 0}
     passes = sum(1 for r in runs if r.get("pass"))
     tokens = [r["tokens"] for r in runs if r.get("tokens") is not None]
     walls = [r["wall_s"] for r in runs if r.get("wall_s") is not None]
@@ -71,8 +71,18 @@ def _write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def run_one_repeat(task: Task, *, agent_cmd: str, arm: str,
-                   repeat: int, out_dir: Path, with_path: str | None) -> dict:
+def _write_text_atomic(path: Path, text: str) -> None:
+    """Write ``path`` via a temp file + rename, so a concurrent reader
+    never sees a half-written report."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def run_one_repeat(
+    task: Task, *, agent_cmd: str, arm: str, repeat: int, out_dir: Path, with_path: str | None
+) -> dict:
     """Run a single (arm, repeat) and return its run record."""
     run_dir = out_dir / arm / str(repeat)
     work = run_dir / "work"
@@ -98,8 +108,9 @@ def run_one_repeat(task: Task, *, agent_cmd: str, arm: str,
     setup_exit: int | None = None
     setup_timed_out = False
     if task.setup_path is not None:
-        setup = run_script(work / "setup.sh", cwd=work,
-                           path_value=path_value, timeout_s=task.timeout_s)
+        setup = run_script(
+            work / "setup.sh", cwd=work, path_value=path_value, timeout_s=task.timeout_s
+        )
         setup_exit = setup.exit_code
         setup_timed_out = setup.timed_out
         _write_text(run_dir / "setup_stdout.log", setup.stdout_text)
@@ -117,8 +128,9 @@ def run_one_repeat(task: Task, *, agent_cmd: str, arm: str,
     else:
         agent_env = dict(os.environ)
         agent_env["PATH"] = path_value
-        agent_result = run_agent(agent_cmd, task.prompt_text, cwd=work,
-                                 env=agent_env, timeout_s=task.timeout_s)
+        agent_result = run_agent(
+            agent_cmd, task.prompt_text, cwd=work, env=agent_env, timeout_s=task.timeout_s
+        )
         agent_exit = agent_result.exit_code
         tokens = parse_tokens(agent_result.stdout_text)
         wall_s = round(agent_result.wall_s, 3)
@@ -131,8 +143,9 @@ def run_one_repeat(task: Task, *, agent_cmd: str, arm: str,
     if setup_timed_out:
         check_line = "setup timed out"
     else:
-        check = run_script(work / "check.sh", cwd=work,
-                           path_value=path_value, timeout_s=task.timeout_s)
+        check = run_script(
+            work / "check.sh", cwd=work, path_value=path_value, timeout_s=task.timeout_s
+        )
         check_exit = check.exit_code
         check_line = _first_line(check.stdout_text) or _first_line(check.stderr_text)
         _write_text(run_dir / "check_stdout.log", check.stdout_text)
@@ -145,12 +158,7 @@ def run_one_repeat(task: Task, *, agent_cmd: str, arm: str,
     if timed_out and not check_line:
         check_line = "timed out"
 
-    passed = (
-        check_exit == 0
-        and not timed_out
-        and setup_exit in (None, 0)
-        and not setup_timed_out
-    )
+    passed = check_exit == 0 and not timed_out and setup_exit in (None, 0) and not setup_timed_out
 
     return {
         "arm": arm,
@@ -168,9 +176,16 @@ def run_one_repeat(task: Task, *, agent_cmd: str, arm: str,
     }
 
 
-def run_benchmark(task: Task, *, agent_cmd: str, with_path: str | None,
-                  without: bool, repeat: int | None, out_dir: str | Path,
-                  timeout_s: int | None = None) -> dict:
+def run_benchmark(
+    task: Task,
+    *,
+    agent_cmd: str,
+    with_path: str | None,
+    without: bool,
+    repeat: int | None,
+    out_dir: str | Path,
+    timeout_s: int | None = None,
+) -> dict:
     """Run the benchmark and write ``<out>/run.json``.
 
     Arms: when ``with_path`` is given the default is *both* arms (the
@@ -182,9 +197,9 @@ def run_benchmark(task: Task, *, agent_cmd: str, with_path: str | None,
     """
     if not agent_cmd or not agent_cmd.strip():
         raise BenchError(
-            "TASK_INVALID", "No agent command given.",
-            "Pass --agent with the agent command, for example "
-            "'claude -p --output-format json'.",
+            "TASK_INVALID",
+            "No agent command given.",
+            "Pass --agent with the agent command, for example 'claude -p --output-format json'.",
             "Run agentbench doctor to check the agent command.",
             exit_code=2,
         )
@@ -198,14 +213,16 @@ def run_benchmark(task: Task, *, agent_cmd: str, with_path: str | None,
         out.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise BenchError(
-            "TOOL_FAILURE", f"Output directory cannot be created: {out}",
+            "TOOL_FAILURE",
+            f"Output directory cannot be created: {out}",
             "Pass --out with a writable directory.",
             "Check permissions on the parent directory and run again.",
             exit_code=3,
         ) from exc
     if not os.access(out, os.W_OK):
         raise BenchError(
-            "TOOL_FAILURE", f"Output directory is not writable: {out}",
+            "TOOL_FAILURE",
+            f"Output directory is not writable: {out}",
             "Pass --out with a writable directory.",
             "Check permissions on the output directory and run again.",
             exit_code=3,
@@ -214,16 +231,18 @@ def run_benchmark(task: Task, *, agent_cmd: str, with_path: str | None,
     n_repeat = repeat if repeat is not None else task.repeat
     if n_repeat < 1:
         raise BenchError(
-            "TASK_INVALID", f"Repeat must be 1 or more, got {n_repeat}.",
+            "TASK_INVALID",
+            f"Repeat must be 1 or more, got {n_repeat}.",
             "Pass --repeat with a positive integer.",
             "Omit --repeat to use the task meta.json repeat.",
             exit_code=2,
         )
     if timeout_s is not None:
-        if timeout_s <= 0:
+        if timeout_s <= 0 or timeout_s > MAX_TIMEOUT_S:
             raise BenchError(
-                "TASK_INVALID", f"Timeout must be positive, got {timeout_s}.",
-                "Pass --timeout-s with a positive integer number of seconds.",
+                "TASK_INVALID",
+                f"Timeout must be between 1 and {MAX_TIMEOUT_S}, got {timeout_s}.",
+                f"Pass --timeout-s with a value between 1 and {MAX_TIMEOUT_S}.",
                 "Omit --timeout-s to use the task meta.json timeout_s.",
                 exit_code=2,
             )
@@ -235,7 +254,8 @@ def run_benchmark(task: Task, *, agent_cmd: str, with_path: str | None,
             with_abs = (Path.cwd() / with_abs).resolve()
         if not with_abs.is_dir():
             raise BenchError(
-                "TASK_INVALID", f"--with path does not exist: {with_abs}",
+                "TASK_INVALID",
+                f"--with path does not exist: {with_abs}",
                 "Pass --with with the directory containing the tool under test.",
                 "Check the tool path and run again.",
                 exit_code=2,
@@ -250,22 +270,38 @@ def run_benchmark(task: Task, *, agent_cmd: str, with_path: str | None,
     runs: list[dict] = []
     for arm in arms:
         for n in range(1, n_repeat + 1):
-            runs.append(run_one_repeat(
-                task, agent_cmd=agent_cmd, arm=arm, repeat=n,
-                out_dir=out, with_path=with_path,
-            ))
+            runs.append(
+                run_one_repeat(
+                    task,
+                    agent_cmd=agent_cmd,
+                    arm=arm,
+                    repeat=n,
+                    out_dir=out,
+                    with_path=with_path,
+                )
+            )
     _ = started
 
     summary = {}
     for arm in arms:
         summary[arm] = summarize_runs([r for r in runs if r["arm"] == arm])
 
+    # run_id identifies this invocation. Two runs writing to the same
+    # --out race on run.json (last writer wins), but every run's full
+    # report is also preserved under runs/<run_id>.json, and `report`
+    # reads those too. Per-arm/per-repeat logs share <out>/<arm>/<n>/
+    # by design (the spec's layout), so concurrent runs to the SAME
+    # --out can still clobber each other's logs -- use a distinct
+    # --out per concurrent run. See docs/DECISIONS.md.
+    run_id = uuid.uuid4().hex
     report = {
         "ok": True,
+        "run_id": run_id,
         "task": str(task.directory.resolve()),
         "summary": summary,
         "runs": runs,
     }
-    _write_text(out / "run.json",
-                json.dumps(report, sort_keys=True, indent=2) + "\n")
+    text = json.dumps(report, sort_keys=True, indent=2) + "\n"
+    _write_text_atomic(out / "run.json", text)
+    _write_text_atomic(out / "runs" / f"{run_id}.json", text)
     return report

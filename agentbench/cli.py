@@ -10,7 +10,7 @@ Exit codes: 0 success, 1 at least one run failed (not an error),
 
 Telemetry: one JSON line to stderr per invocation::
 
-    {"tool":"agentbench","version":"0.1.0","command":"run",
+    {"tool":"agentbench","version":"0.1.1","command":"run",
      "duration_ms":123,"input_bytes":4567,"output_bytes":890,"ok":true}
 
 An adapter envelope may be passed with ``--request <path>`` instead of
@@ -27,7 +27,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import sys
 import tempfile
 import time
@@ -37,7 +36,7 @@ from . import BenchError, __version__
 from .agent import check_agent_present
 from .report import build_report, compare_reports, render_table
 from .run import run_benchmark
-from .task import DEFAULT_TIMEOUT_S, load_task
+from .task import load_task
 
 PROTOCOL = "arabica-plugin-v1"
 COMMANDS = ["run", "compare", "report", "self-test", "doctor", "version"]
@@ -70,41 +69,100 @@ EMBEDDED_FIXTURES = {
         "prompt.md": "Do nothing. This task always passes.\n",
         "check.sh": "#!/bin/sh\nexit 0\n",
         "agent.sh": "#!/bin/sh\ncat > /dev/null\nexit 0\n",
-        "expected.json": {"with": {"pass": True, "tokens": None},
-                          "without": {"pass": True, "tokens": None}},
+        "expected.json": {
+            "with": {"pass": True, "tokens": None},
+            "without": {"pass": True, "tokens": None},
+        },
     },
     "fail": {
         "prompt.md": "Do nothing. This task always fails.\n",
         "check.sh": "#!/bin/sh\nexit 1\n",
         "agent.sh": "#!/bin/sh\ncat > /dev/null\nexit 0\n",
-        "expected.json": {"with": {"pass": False, "tokens": None},
-                          "without": {"pass": False, "tokens": None}},
+        "expected.json": {
+            "with": {"pass": False, "tokens": None},
+            "without": {"pass": False, "tokens": None},
+        },
     },
     "tokens": {
         "prompt.md": "Report your token usage as JSON.\n",
         "check.sh": "#!/bin/sh\nexit 0\n",
         "agent.sh": "#!/bin/sh\ncat > /dev/null\n"
-                    "printf '%s\\n' '{\"usage\":{\"input_tokens\":10,"
-                    "\"output_tokens\":20}}'\nexit 0\n",
-        "expected.json": {"with": {"pass": True, "tokens": 30},
-                          "without": {"pass": True, "tokens": 30}},
+        'printf \'%s\\n\' \'{"usage":{"input_tokens":10,'
+        '"output_tokens":20}}\'\nexit 0\n',
+        "expected.json": {
+            "with": {"pass": True, "tokens": 30},
+            "without": {"pass": True, "tokens": 30},
+        },
     },
     "timeout": {
         "prompt.md": "Take too long.\n",
         "check.sh": "#!/bin/sh\nexit 0\n",
         "agent.sh": "#!/bin/sh\nsleep 10\nexit 0\n",
         "meta.json": json.dumps({"timeout_s": 2}),
-        "expected.json": {"with": {"pass": False, "tokens": None, "timed_out": True},
-                          "without": {"pass": False, "tokens": None, "timed_out": True}},
+        "expected.json": {
+            "with": {"pass": False, "tokens": None, "timed_out": True},
+            "without": {"pass": False, "tokens": None, "timed_out": True},
+        },
     },
     "path": {
         "prompt.md": "Use the tool on PATH if it is there.\n",
         "check.sh": "#!/bin/sh\ntest -f tool_marker.txt\n",
         "agent.sh": "#!/bin/sh\ncat > /dev/null\n"
-                    "case \":$PATH:\" in *toolbin*) touch tool_marker.txt ;;\n"
-                    "esac\nexit 0\n",
-        "expected.json": {"with": {"pass": True, "tokens": None},
-                          "without": {"pass": False, "tokens": None}},
+        'case ":$PATH:" in *toolbin*) touch tool_marker.txt ;;\n'
+        "esac\nexit 0\n",
+        "expected.json": {
+            "with": {"pass": True, "tokens": None},
+            "without": {"pass": False, "tokens": None},
+        },
+    },
+    # Realistic agent output shapes (see docs/DECISIONS.md for sources).
+    # Claude Code --output-format json: one result envelope whose usage
+    # includes cache buckets; tokens = 100 + 50 + 200 + 500 = 850.
+    "claude-json": {
+        "prompt.md": "Do the task and report usage as Claude Code does.\n",
+        "check.sh": "#!/bin/sh\nexit 0\n",
+        "agent.sh": "#!/bin/sh\ncat > /dev/null\n"
+        'printf \'%s\\n\' \'{"type": "result", "subtype": "success", '
+        '"result": "done", "usage": {"input_tokens": 100, '
+        '"output_tokens": 50, "cache_creation_input_tokens": 200, '
+        '"cache_read_input_tokens": 500}}\'\nexit 0\n',
+        "expected.json": {
+            "with": {"pass": True, "tokens": 850},
+            "without": {"pass": True, "tokens": 850},
+        },
+    },
+    # Claude Code stream-json: NDJSON, last line is the result envelope
+    # (650); the earlier assistant message usage (15) must not win.
+    "claude-stream": {
+        "prompt.md": "Do the task, streaming JSON events as Claude Code does.\n",
+        "check.sh": "#!/bin/sh\nexit 0\n",
+        "agent.sh": "#!/bin/sh\ncat > /dev/null\n"
+        'printf \'%s\\n\' \'{"type": "assistant", "message": '
+        '{"usage": {"input_tokens": 10, "output_tokens": 5}}}\'\n'
+        'printf \'%s\\n\' \'{"type": "result", "usage": '
+        '{"input_tokens": 100, "output_tokens": 50, '
+        '"cache_read_input_tokens": 500}}\'\nexit 0\n',
+        "expected.json": {
+            "with": {"pass": True, "tokens": 650},
+            "without": {"pass": True, "tokens": 650},
+        },
+    },
+    # pi --mode json: one usage object per turn; they are SUMMED:
+    # (40+10+20+5) + (60+20+0+10) = 165.
+    "pi-json": {
+        "prompt.md": "Do the task, emitting pi --mode json events.\n",
+        "check.sh": "#!/bin/sh\nexit 0\n",
+        "agent.sh": "#!/bin/sh\ncat > /dev/null\n"
+        'printf \'%s\\n\' \'{"type": "message_end", "usage": '
+        '{"input": 40, "output": 10, "cacheRead": 20, '
+        '"cacheWrite": 5}}\'\n'
+        'printf \'%s\\n\' \'{"type": "message_end", "usage": '
+        '{"input": 60, "output": 20, "cacheRead": 0, '
+        '"cacheWrite": 10}}\'\nexit 0\n',
+        "expected.json": {
+            "with": {"pass": True, "tokens": 165},
+            "without": {"pass": True, "tokens": 165},
+        },
     },
 }
 
@@ -112,9 +170,11 @@ EMBEDDED_FIXTURES = {
 def find_fixtures_dir() -> Path | None:
     """Locate the repo fixtures/ directory, if this is a checkout."""
     here = Path(__file__).resolve()
-    for candidate in (here.parent.parent / "fixtures",
-                      here.parent / "fixtures",
-                      Path.cwd() / "fixtures"):
+    for candidate in (
+        here.parent.parent / "fixtures",
+        here.parent / "fixtures",
+        Path.cwd() / "fixtures",
+    ):
         if (candidate / "pass" / "task" / "prompt.md").is_file():
             return candidate
     return None
@@ -128,7 +188,8 @@ def _materialise_embedded(tmp: Path) -> Path:
         for filename, content in files.items():
             if filename == "expected.json":
                 (root / name / "expected.json").write_text(
-                    json.dumps(content, sort_keys=True, indent=2), encoding="utf-8")
+                    json.dumps(content, sort_keys=True, indent=2), encoding="utf-8"
+                )
                 continue
             dest = task_dir / filename
             dest.write_text(content, encoding="utf-8")
@@ -154,9 +215,12 @@ def run_self_test(fixtures_dir: str | Path | None = None) -> dict:
         root = Path(fixtures_dir)
         if not root.is_dir():
             raise BenchError(
-                "TASK_INVALID", f"Fixtures directory does not exist: {root}",
+                "TASK_INVALID",
+                f"Fixtures directory does not exist: {root}",
                 "Omit --fixtures to use the bundled fixtures.",
-                "Check the fixtures path and run again.", exit_code=2)
+                "Check the fixtures path and run again.",
+                exit_code=2,
+            )
     else:
         root = find_fixtures_dir()
 
@@ -180,8 +244,7 @@ def run_self_test(fixtures_dir: str | Path | None = None) -> dict:
                 continue
             agent = task_dir / "agent.sh"
             if not agent.is_file():
-                results.append({"fixture": fixture.name, "ok": False,
-                                "error": "missing agent.sh"})
+                results.append({"fixture": fixture.name, "ok": False, "error": "missing agent.sh"})
                 continue
             # Do NOT chmod the fixture in place: that would mutate the
             # user's checkout. run_agent runs a non-executable script
@@ -195,11 +258,15 @@ def run_self_test(fixtures_dir: str | Path | None = None) -> dict:
             try:
                 task = load_task(task_dir)
                 report = run_benchmark(
-                    task, agent_cmd=str(agent), with_path=with_path,
-                    without=True, repeat=1, out_dir=out_dir)
+                    task,
+                    agent_cmd=str(agent),
+                    with_path=with_path,
+                    without=True,
+                    repeat=1,
+                    out_dir=out_dir,
+                )
             except BenchError as exc:
-                results.append({"fixture": fixture.name, "ok": False,
-                                "error": exc.blocked})
+                results.append({"fixture": fixture.name, "ok": False, "error": exc.blocked})
                 continue
             by_arm = {r["arm"]: r for r in report["runs"]}
             problems: list[str] = []
@@ -209,18 +276,14 @@ def run_self_test(fixtures_dir: str | Path | None = None) -> dict:
                     problems.append(f"missing {arm} run")
                     continue
                 if got["pass"] != want.get("pass"):
-                    problems.append(
-                        f"{arm}: pass={got['pass']} expected {want.get('pass')}")
+                    problems.append(f"{arm}: pass={got['pass']} expected {want.get('pass')}")
                 if "tokens" in want and got["tokens"] != want["tokens"]:
-                    problems.append(
-                        f"{arm}: tokens={got['tokens']} expected {want['tokens']}")
+                    problems.append(f"{arm}: tokens={got['tokens']} expected {want['tokens']}")
                 if "timed_out" in want and got["timed_out"] != want["timed_out"]:
                     problems.append(
-                        f"{arm}: timed_out={got['timed_out']} "
-                        f"expected {want['timed_out']}")
-            results.append({"fixture": fixture.name,
-                            "ok": not problems,
-                            "problems": problems})
+                        f"{arm}: timed_out={got['timed_out']} expected {want['timed_out']}"
+                    )
+            results.append({"fixture": fixture.name, "ok": not problems, "problems": problems})
     ok = bool(results) and all(r["ok"] for r in results)
     return {"ok": ok, "fixtures": results}
 
@@ -231,8 +294,7 @@ def run_doctor(agent_cmd: str | None = None, out_dir: str | Path | None = None) 
     python_ok = sys.version_info >= (3, 11)
     checks["python"] = {
         "ok": python_ok,
-        "detail": f"Python {sys.version.split()[0]} "
-                  f"({'ok' if python_ok else 'needs 3.11+'})",
+        "detail": f"Python {sys.version.split()[0]} ({'ok' if python_ok else 'needs 3.11+'})",
     }
     if agent_cmd:
         present, detail = check_agent_present(agent_cmd)
@@ -251,13 +313,26 @@ def run_doctor(agent_cmd: str | None = None, out_dir: str | Path | None = None) 
             checks["out"] = {"ok": False, "detail": f"output directory not writable: {exc}"}
     else:
         with tempfile.TemporaryDirectory(prefix="agentbench-doctor-") as tmp:
-            checks["out"] = {"ok": True,
-                             "detail": f"temporary output directory writable: {tmp}"}
+            checks["out"] = {"ok": True, "detail": f"temporary output directory writable: {tmp}"}
     fixtures = find_fixtures_dir()
     checks["fixtures"] = {
         "ok": True,
-        "detail": f"fixtures found at {fixtures}" if fixtures
-                  else "fixtures not in checkout; embedded fixtures will be used",
+        "detail": f"fixtures found at {fixtures}"
+        if fixtures
+        else "fixtures not in checkout; embedded fixtures will be used",
+    }
+    # Platform is informational, except on Windows: the bench needs a
+    # POSIX shell and process groups (os.killpg), which Windows does
+    # not provide. macOS is POSIX but has not been verified here.
+    import platform as _platform
+
+    posix = os.name == "posix"
+    platform_note = (
+        "POSIX" if posix else "not POSIX; agentbench needs a POSIX shell and process groups"
+    )
+    checks["platform"] = {
+        "ok": posix,
+        "detail": f"{_platform.system()} {sys.platform} ({platform_note})",
     }
     ok = all(c["ok"] for c in checks.values())
     return {"ok": ok, "checks": checks}
@@ -265,32 +340,48 @@ def run_doctor(agent_cmd: str | None = None, out_dir: str | Path | None = None) 
 
 # ---------------------------------------------------------------- envelope
 
+
 def load_envelope(path: str | Path) -> dict:
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise BenchError(
-            "TASK_INVALID", f"Request envelope is not valid JSON: {path}",
+            "TASK_INVALID",
+            f"Request envelope is not valid JSON: {path}",
             "Pass --request with a JSON envelope file.",
-            "Check the envelope file and run again.", exit_code=2) from exc
+            "Check the envelope file and run again.",
+            exit_code=2,
+        ) from exc
     if not isinstance(data, dict) or data.get("protocol") != PROTOCOL:
         raise BenchError(
-            "TASK_INVALID", "Request envelope protocol must be 'arabica-plugin-v1'.",
+            "TASK_INVALID",
+            "Request envelope protocol must be 'arabica-plugin-v1'.",
             "Set protocol to 'arabica-plugin-v1' in the envelope.",
-            "Check the envelope and run again.", exit_code=2)
+            "Check the envelope and run again.",
+            exit_code=2,
+        )
     if data.get("command") not in COMMANDS:
         raise BenchError(
-            "TASK_INVALID", f"Unknown command in envelope: {data.get('command')!r}",
+            "TASK_INVALID",
+            f"Unknown command in envelope: {data.get('command')!r}",
             f"Use one of: {', '.join(COMMANDS)}.",
-            "Check the envelope and run again.", exit_code=2)
+            "Check the envelope and run again.",
+            exit_code=2,
+        )
     args = data.get("args") or {}
     if not isinstance(args, dict):
         raise BenchError(
-            "TASK_INVALID", "Request envelope args must be a JSON object.",
-            "Make args an object, for example {\"task\": \"/abs/task\"}.",
-            "Check the envelope and run again.", exit_code=2)
-    return {"command": data["command"], "args": args,
-            "json": bool(data.get("json") or args.get("json"))}
+            "TASK_INVALID",
+            "Request envelope args must be a JSON object.",
+            'Make args an object, for example {"task": "/abs/task"}.',
+            "Check the envelope and run again.",
+            exit_code=2,
+        )
+    return {
+        "command": data["command"],
+        "args": args,
+        "json": bool(data.get("json") or args.get("json")),
+    }
 
 
 def _dispatch_envelope(envelope: dict):
@@ -309,12 +400,17 @@ def _dispatch_envelope(envelope: dict):
         return _do_doctor(args, as_json)
     if command == "version":
         return _do_version(as_json)
-    raise BenchError("TASK_INVALID", f"Unknown command: {command}",
-                     f"Use one of: {', '.join(COMMANDS)}.",
-                     "Check the command and run again.", exit_code=2)
+    raise BenchError(
+        "TASK_INVALID",
+        f"Unknown command: {command}",
+        f"Use one of: {', '.join(COMMANDS)}.",
+        "Check the command and run again.",
+        exit_code=2,
+    )
 
 
 # ---------------------------------------------------------------- commands
+
 
 def _do_run(args: dict, as_json: bool):
     task = load_task(args["task"])
@@ -391,15 +487,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agentbench",
         description="Run one task with and without a tool, then report "
-                    "pass, tokens, calls and wall time.")
-    parser.add_argument("--version", action="store_true",
-                        help="Print agentbench version and exit.")
-    parser.add_argument("--self-test", action="store_true",
-                        help="Run every fixture in fixtures/ and exit.")
-    parser.add_argument("--json", action="store_true",
-                        help="Write one JSON object to stdout.")
-    parser.add_argument("--request", metavar="PATH",
-                        help="Read an adapter envelope JSON file instead of flags.")
+        "pass, tokens, calls and wall time.",
+    )
+    parser.add_argument("--version", action="store_true", help="Print agentbench version and exit.")
+    parser.add_argument(
+        "--self-test", action="store_true", help="Run every fixture in fixtures/ and exit."
+    )
+    parser.add_argument("--json", action="store_true", help="Write one JSON object to stdout.")
+    parser.add_argument(
+        "--request", metavar="PATH", help="Read an adapter envelope JSON file instead of flags."
+    )
     sub = parser.add_subparsers(dest="command")
 
     run_p = sub.add_parser("run", help="Run one task with and without a tool.")
@@ -486,20 +583,25 @@ def main(argv: list[str] | None = None) -> int:
         command = ns.command
         if command == "run":
             exit_code, _r, input_bytes = _do_run(
-                {"task": ns.task, "agent": ns.agent, "with": ns.with_,
-                 "without": ns.without, "repeat": ns.repeat, "out": ns.out,
-                 "timeout_s": ns.timeout_s}, as_json)
+                {
+                    "task": ns.task,
+                    "agent": ns.agent,
+                    "with": ns.with_,
+                    "without": ns.without,
+                    "repeat": ns.repeat,
+                    "out": ns.out,
+                    "timeout_s": ns.timeout_s,
+                },
+                as_json,
+            )
         elif command == "compare":
-            exit_code, _r, input_bytes = _do_compare(
-                {"a": ns.a, "b": ns.b}, as_json)
+            exit_code, _r, input_bytes = _do_compare({"a": ns.a, "b": ns.b}, as_json)
         elif command == "report":
             exit_code, _r, input_bytes = _do_report({"out": ns.out}, as_json)
         elif command == "self-test":
-            exit_code, _r, input_bytes = _do_self_test(
-                {"fixtures": ns.fixtures}, as_json)
+            exit_code, _r, input_bytes = _do_self_test({"fixtures": ns.fixtures}, as_json)
         elif command == "doctor":
-            exit_code, _r, input_bytes = _do_doctor(
-                {"agent": ns.agent, "out": ns.out}, as_json)
+            exit_code, _r, input_bytes = _do_doctor({"agent": ns.agent, "out": ns.out}, as_json)
         elif command == "version":
             exit_code, _r, input_bytes = _do_version(as_json)
         else:
@@ -518,10 +620,12 @@ def main(argv: list[str] | None = None) -> int:
         ok = False
         exit_code = 3
         err = BenchError(
-            "TOOL_FAILURE", f"agentbench failed: {exc}",
+            "TOOL_FAILURE",
+            f"agentbench failed: {exc}",
             "Check the command, the task directory and the output directory.",
             "Run agentbench doctor, then run the command again.",
-            exit_code=3)
+            exit_code=3,
+        )
         output_bytes = _emit(dump(err.as_dict()))
         return exit_code
     finally:

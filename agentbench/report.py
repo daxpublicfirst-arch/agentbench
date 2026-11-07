@@ -13,7 +13,8 @@ def load_report(path: str | Path) -> dict:
     path = Path(path)
     if not path.is_file():
         raise BenchError(
-            "TASK_INVALID", f"Run report not found: {path}",
+            "TASK_INVALID",
+            f"Run report not found: {path}",
             "Pass --a / --b with the path of a run.json produced by agentbench run.",
             "Run agentbench run first and check the --out directory.",
             exit_code=2,
@@ -22,14 +23,16 @@ def load_report(path: str | Path) -> dict:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise BenchError(
-            "TASK_INVALID", f"Run report is not valid JSON: {path}",
+            "TASK_INVALID",
+            f"Run report is not valid JSON: {path}",
             "Pass a run.json file produced by agentbench run.",
             "Re-run agentbench run to regenerate the report.",
             exit_code=2,
         ) from exc
     if not isinstance(data, dict):
         raise BenchError(
-            "TASK_INVALID", f"Run report must be a JSON object: {path}",
+            "TASK_INVALID",
+            f"Run report must be a JSON object: {path}",
             "Pass a run.json file produced by agentbench run.",
             "Re-run agentbench run to regenerate the report.",
             exit_code=2,
@@ -47,8 +50,7 @@ def aggregate(report: dict) -> dict:
         return summarize_runs(report["runs"])
     summary = report.get("summary")
     if isinstance(summary, dict):
-        arms = [v for v in summary.values() if isinstance(v, dict)
-                and "pass_rate" in v]
+        arms = [v for v in summary.values() if isinstance(v, dict) and "pass_rate" in v]
         if len(arms) == 1:
             return arms[0]
         if arms:
@@ -57,8 +59,7 @@ def aggregate(report: dict) -> dict:
             # leave medians to the caller-visible arms. For compare we
             # use the first arm's medians only when there is one arm.
             combined = {
-                "pass_rate": round(
-                    sum(a["pass_rate"] for a in arms) / len(arms), 4),
+                "pass_rate": round(sum(a["pass_rate"] for a in arms) / len(arms), 4),
                 "tokens_median": None,
                 "wall_median_s": None,
                 "runs": sum(a.get("runs", 0) for a in arms),
@@ -72,7 +73,8 @@ def aggregate(report: dict) -> dict:
             "runs": report.get("runs", 0),
         }
     raise BenchError(
-        "TASK_INVALID", "Run report has no runs or summary to compare.",
+        "TASK_INVALID",
+        "Run report has no runs or summary to compare.",
         "Pass run.json files produced by agentbench run.",
         "Re-run agentbench run to regenerate the reports.",
         exit_code=2,
@@ -106,15 +108,24 @@ def find_run_reports(out_dir: str | Path) -> list[Path]:
     out = Path(out_dir)
     if not out.is_dir():
         raise BenchError(
-            "TASK_INVALID", f"Output directory does not exist: {out}",
+            "TASK_INVALID",
+            f"Output directory does not exist: {out}",
             "Pass --out with the directory agentbench run wrote to.",
             "Run agentbench run first and check the --out directory.",
             exit_code=2,
         )
-    reports = sorted(out.rglob("run.json"))
+    # run.json at any depth, plus the per-run copies preserved as
+    # runs/<run_id>.json (see run.py). Deduplicated and sorted so the
+    # report is deterministic for the same run data.
+    found = {p for p in out.rglob("run.json") if p.is_file()}
+    runs_dir = out / "runs"
+    if runs_dir.is_dir():
+        found |= {p for p in runs_dir.glob("*.json") if p.is_file()}
+    reports = sorted(found)
     if not reports:
         raise BenchError(
-            "TASK_INVALID", f"No run.json found under: {out}",
+            "TASK_INVALID",
+            f"No run.json found under: {out}",
             "Run agentbench run with --out pointing at this directory first.",
             "Check the --out path and run again.",
             exit_code=2,
@@ -128,12 +139,14 @@ def build_report(out_dir: str | Path) -> dict:
     entries = []
     for path in reports:
         data = load_report(path)
-        entries.append({
-            "file": str(path.resolve()),
-            "task": data.get("task"),
-            "summary": data.get("summary", {}),
-            "runs": len(data.get("runs", [])),
-        })
+        entries.append(
+            {
+                "file": str(path.resolve()),
+                "task": data.get("task"),
+                "summary": data.get("summary", {}),
+                "runs": len(data.get("runs", [])),
+            }
+        )
     return {"ok": True, "out": str(Path(out_dir).resolve()), "reports": entries}
 
 

@@ -44,53 +44,157 @@ class CommandResult:
     stderr_text: str
 
 
+# Token buckets, counted once each. Cache tokens are input-side: in the
+# Anthropic-style buckets ``input_tokens`` excludes cache reads and
+# cache writes, so a faithful total is input + cache read + cache
+# creation + output. Reasoning tokens are a *subset* of output (they
+# are already inside ``output_tokens``), so they are deliberately NOT
+# listed here -- adding them would double-count.
+_INPUT_KEYS = (
+    "input_tokens",
+    "prompt_tokens",
+    "inputTokens",
+    "input",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "cacheCreationInputTokens",
+    "cacheReadInputTokens",
+    "cacheRead",
+    "cacheWrite",
+    "cacheReadTokens",
+    "cacheWriteTokens",
+)
+_OUTPUT_KEYS = ("output_tokens", "completion_tokens", "outputTokens", "output")
+
+
+def _as_int(value) -> int | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return int(value)
+    return None
+
+
 def tokens_from_usage(usage) -> int | None:
-    """Total tokens from a ``usage`` object, or ``None`` if unknowable."""
+    """Total tokens from a ``usage``-shaped object, or ``None``.
+
+    Accepts the documented shapes (see docs/DECISIONS.md): Anthropic /
+    Claude ``usage`` (snake_case, incl. cache buckets), OpenAI
+    ``prompt_tokens`` / ``completion_tokens``, Claude ``modelUsage``
+    values and pi ``token_usage`` events (camelCase), and pi
+    ``usage`` (``input`` / ``output`` / ``cacheRead`` / ``cacheWrite``).
+    A ``total_tokens`` / ``totalTokens`` / ``tokens`` field, when
+    present, wins over summing the buckets. Anything else is ``None``.
+    """
     if not isinstance(usage, dict):
         return None
-    for key in ("total_tokens", "tokens"):
-        value = usage.get(key)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return int(value)
+    for key in ("total_tokens", "totalTokens", "tokens"):
+        value = _as_int(usage.get(key))
+        if value is not None:
+            return value
     total = 0
     found = False
-    for pair in (("input_tokens", "output_tokens"),
-                 ("prompt_tokens", "completion_tokens")):
-        a, b = pair
-        if a in usage or b in usage:
-            for key in pair:
-                value = usage.get(key)
-                if isinstance(value, (int, float)) and not isinstance(value, bool):
-                    total += int(value)
-                    found = True
+    for key in _INPUT_KEYS + _OUTPUT_KEYS:
+        value = _as_int(usage.get(key))
+        if value is not None:
+            total += value
+            found = True
     return total if found else None
+
+
+def _is_pi_style_usage(usage: dict) -> bool:
+    """True for pi's per-turn ``usage`` (``input``/``output`` buckets).
+
+    Pi reports one ``usage`` object per turn and the harness sums them;
+    Claude reports one aggregate ``usage`` object. The key sets do not
+    overlap (pi uses bare ``input``/``output``, Claude uses
+    ``input_tokens``/``output_tokens``), so the shape tells them apart.
+    """
+    return (
+        bool(set(usage) & {"input", "output", "cacheRead", "cacheWrite"})
+        and "input_tokens" not in usage
+        and "output_tokens" not in usage
+    )
+
+
+def _usage_candidates(obj: object) -> list[tuple[str, int]]:
+    """``(kind, tokens)`` pairs found in one parsed JSON object.
+
+    Kind is ``"aggregate"`` for a whole-run total (a Claude result
+    envelope, or a per-model ``modelUsage`` breakdown) and
+    ``"per_turn"`` for one turn's usage (a pi ``message_end`` event, a
+    Claude stream ``message.usage``, or a pi-agent ``token_usage``
+    event). ``modelUsage`` is only used when there is no top-level
+    ``usage`` -- the two describe the same run, and counting both
+    would double-count.
+    """
+    if not isinstance(obj, dict):
+        return []
+    found: list[tuple[str, int]] = []
+    if obj.get("type") == "token_usage":
+        tokens = tokens_from_usage(obj)
+        if tokens is not None:
+            found.append(("per_turn", tokens))
+        return found
+    usage = obj.get("usage")
+    if isinstance(usage, dict):
+        tokens = tokens_from_usage(usage)
+        if tokens is not None:
+            kind = "per_turn" if _is_pi_style_usage(usage) else "aggregate"
+            found.append((kind, tokens))
+    elif isinstance(obj.get("modelUsage"), dict):
+        total = 0
+        any_tokens = False
+        for per_model in obj["modelUsage"].values():
+            tokens = tokens_from_usage(per_model)
+            if tokens is not None:
+                total += tokens
+                any_tokens = True
+        if any_tokens:
+            found.append(("aggregate", total))
+    message = obj.get("message")
+    if isinstance(message, dict) and isinstance(message.get("usage"), dict):
+        tokens = tokens_from_usage(message["usage"])
+        if tokens is not None:
+            found.append(("per_turn", tokens))
+    return found
 
 
 def parse_tokens(stdout_text: str) -> int | None:
     """Parse tokens from agent stdout.
 
-    The stdout must be JSON (as a whole, or one JSON object per line)
-    with a top-level ``usage`` object. Anything else yields ``None``.
+    The stdout must be JSON: either one object, or one JSON object per
+    line (NDJSON, as in ``claude --output-format stream-json`` and
+    ``pi --mode json``). Supported shapes are the documented ones in
+    ``_usage_candidates``. Combining rule: if any whole-run aggregate
+    exists, the LAST one wins (a Claude stream's final result envelope
+    is the aggregate); otherwise per-turn usages are SUMMED (pi
+    reports one ``usage`` per turn). Anything else yields ``None`` --
+    a missing token count is never guessed and never zero.
     """
-    candidates: list[object] = []
+    objects: list[object] = []
     stripped = stdout_text.strip()
     if stripped:
         try:
-            candidates.append(json.loads(stripped))
+            objects.append(json.loads(stripped))
         except json.JSONDecodeError:
-            pass
-        for line in stripped.splitlines():
-            line = line.strip()
-            if line.startswith("{"):
-                try:
-                    candidates.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-    for candidate in candidates:
-        if isinstance(candidate, dict) and "usage" in candidate:
-            tokens = tokens_from_usage(candidate["usage"])
-            if tokens is not None:
-                return tokens
+            for line in stripped.splitlines():
+                line = line.strip()
+                if line.startswith("{"):
+                    try:
+                        objects.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+    aggregates: list[int] = []
+    per_turn: list[int] = []
+    for obj in objects:
+        for kind, tokens in _usage_candidates(obj):
+            if kind == "aggregate":
+                aggregates.append(tokens)
+            else:
+                per_turn.append(tokens)
+    if aggregates:
+        return aggregates[-1]
+    if per_turn:
+        return sum(per_turn)
     return None
 
 
@@ -109,9 +213,7 @@ def _run_process(cmd, *, cwd, env, stdin_text, timeout_s):
         start_new_session=True,
     )
     try:
-        stdout_text, stderr_text = proc.communicate(
-            input=stdin_text, timeout=timeout_s
-        )
+        stdout_text, stderr_text = proc.communicate(input=stdin_text, timeout=timeout_s)
         timed_out = False
         exit_code: int | None = proc.returncode
     except subprocess.TimeoutExpired:
@@ -196,8 +298,9 @@ def _is_text_script(path: Path) -> bool:
         return False
 
 
-def run_agent(agent_cmd: str, prompt_text: str, *, cwd: Path,
-              env: dict, timeout_s: int) -> CommandResult:
+def run_agent(
+    agent_cmd: str, prompt_text: str, *, cwd: Path, env: dict, timeout_s: int
+) -> CommandResult:
     """Run the external agent command in ``cwd``.
 
     If the template contains ``{prompt}`` it is replaced with the
@@ -217,11 +320,14 @@ def run_agent(agent_cmd: str, prompt_text: str, *, cwd: Path,
     if found:
         _start, _end, program = found
         path = Path(program)
-        if ("/" in program and path.is_file()
-                and not os.access(path, os.X_OK) and _is_text_script(path)):
+        if (
+            "/" in program
+            and path.is_file()
+            and not os.access(path, os.X_OK)
+            and _is_text_script(path)
+        ):
             cmd = "sh " + cmd
-    return _run_process(cmd, cwd=cwd, env=env, stdin_text=stdin_text,
-                        timeout_s=timeout_s)
+    return _run_process(cmd, cwd=cwd, env=env, stdin_text=stdin_text, timeout_s=timeout_s)
 
 
 def agent_program(agent_cmd: str) -> str:
@@ -261,7 +367,9 @@ def check_agent_present(agent_cmd: str) -> tuple[bool, str]:
 
 def tool_failure(blocked, fix):
     return BenchError(
-        "TOOL_FAILURE", blocked, fix,
+        "TOOL_FAILURE",
+        blocked,
+        fix,
         "Check the agent command and the output directory, then run again.",
         exit_code=3,
     )

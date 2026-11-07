@@ -24,6 +24,10 @@ from . import BenchError
 DEFAULT_TIMEOUT_S = 600
 DEFAULT_REPEAT = 1
 MAX_TIMEOUT_S = 1800
+# plugin.toml limits.input_mb -- a task larger than this is refused
+# before any file is read, so a huge task cannot exhaust memory.
+INPUT_MB_MAX = 50
+MAX_INPUT_BYTES = INPUT_MB_MAX * 1024 * 1024
 
 
 def _invalid(blocked, fix, if_that_fails="Re-check the task directory and run again."):
@@ -76,6 +80,22 @@ def load_task(task_dir: str | Path) -> Task:
             "Pass --task with the path of an existing task directory.",
         )
 
+    # Size gate first, before reading any file: a task over the
+    # plugin.toml input limit is refused, not loaded into memory.
+    total_bytes = 0
+    for path in directory.rglob("*"):
+        if path.is_file():
+            try:
+                total_bytes += path.stat().st_size
+            except OSError:
+                pass
+    if total_bytes > MAX_INPUT_BYTES:
+        raise _invalid(
+            f"Task is too large: {total_bytes} bytes "
+            f"(limit {MAX_INPUT_BYTES} bytes / {INPUT_MB_MAX} MB).",
+            "Split the task or remove large files from the task directory.",
+        )
+
     prompt_path = directory / "prompt.md"
     if not prompt_path.is_file():
         raise _invalid(
@@ -119,12 +139,12 @@ def load_task(task_dir: str | Path) -> Task:
         except (OSError, json.JSONDecodeError) as exc:
             raise _invalid(
                 f"Task meta.json is not valid JSON: {meta_path}",
-                "Fix meta.json so it parses as JSON, for example {\"timeout_s\": 600}.",
+                'Fix meta.json so it parses as JSON, for example {"timeout_s": 600}.',
             ) from exc
         if not isinstance(meta, dict):
             raise _invalid(
                 f"Task meta.json must be a JSON object: {meta_path}",
-                "Make meta.json an object, for example {\"timeout_s\": 600, \"repeat\": 3}.",
+                'Make meta.json an object, for example {"timeout_s": 600, "repeat": 3}.',
             )
         if "timeout_s" in meta:
             try:
