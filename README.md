@@ -45,7 +45,7 @@ agentbench compare --a ./runs-a/run.json --b ./runs-b/run.json --json
 agentbench report --out ./runs --json
 agentbench self-test
 agentbench doctor
-agentbench --version   # agentbench 0.1.0
+agentbench --version   # agentbench 0.1.1
 ```
 
 ## Commands
@@ -57,7 +57,7 @@ agentbench --version   # agentbench 0.1.0
 | `report --out <dir>` | Table (or JSON with `--json`) over all `run.json` files under `--out` |
 | `self-test` | Run every fixture in `fixtures/` with a fake agent; exit 0 only if all match |
 | `doctor` | Check Python (>= 3.11), the agent command's presence, and the output directory |
-| `version` | Print `agentbench 0.1.0` |
+| `version` | Print `agentbench 0.1.1` |
 
 Every command accepts `--json`. With `--json` it writes one JSON object
 to stdout. `run` and `compare` write JSON either way; `report`,
@@ -94,7 +94,10 @@ its first line as `check`.
 
 ## How a run works
 
-1. Validate the task (`prompt.md` and `check.sh` must exist).
+1. Validate the task (`prompt.md` and `check.sh` must exist, `meta.json`
+   must be sane). The total size of the task directory must be at most
+   50 MB (`plugin.toml` `limits.input_mb`); this is checked before any
+   file is read, and an oversize task is refused with `TASK_INVALID`.
 2. For each arm (`with`, `without`) and each repeat: create
    `<out>/<arm>/<n>/work`, copy `files/` into it (plus `setup.sh` /
    `check.sh`, chmodded executable in the work copy), run `setup.sh`
@@ -105,12 +108,20 @@ its first line as `check`.
 4. `--with <path>` prepends `<path>` to `PATH` for the agent command.
    With `--with` given, both arms run by default; `--without` makes
    the without-arm explicit. With no `--with`, only the `without` arm runs.
-5. `timeout_s` (from `meta.json`, or `--timeout-s`) is enforced and the
-   whole process group is killed on timeout; the run records
-   `timed_out: true` and `pass: false`.
-6. Tokens are parsed only from a JSON `usage` object in the agent's
-   stdout (`input_tokens + output_tokens`, or `total_tokens`). A missing
-   token count is `null`, never zero and never guessed.
+5. `timeout_s` (from `meta.json`, or `--timeout-s`) is enforced, at most
+   1800 s, and the whole process group is killed on timeout; the run
+   records `timed_out: true` and `pass: false`.
+6. Tokens are parsed from JSON in the agent's stdout. Supported shapes:
+   Claude Code `--output-format json` / `stream-json` result envelopes
+   (`usage`, incl. cache buckets, or per-model `modelUsage`), and pi
+   `--mode json` per-turn `usage` events (summed across turns) and
+   pi-agent `token_usage` events. Cache tokens count as input;
+   reasoning tokens are a subset of output and are not double-counted.
+   A missing token count is `null`, never zero and never guessed.
+   See `docs/DESIGN.md` and `docs/DECISIONS.md` for the full table and
+   the sources. Every run also gets a `run_id`; the report is written
+   atomically to `<out>/run.json` and preserved as
+   `<out>/runs/<run_id>.json`.
 
 ## Exit codes and errors
 
@@ -131,8 +142,16 @@ Requires Python 3.11+; no other runtime dependencies.
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"   # or: pip install -e . ; pip install pytest build
 make check                # lint + full tests + self-test + doctor
+make repro-check          # build twice, require byte-identical artifacts
 make dist                 # wheel + sdist in dist/, with dist/SHA256SUMS
 ```
+
+Builds are reproducible: `make dist` sets `SOURCE_DATE_EPOCH` to the
+head commit's timestamp, and `make repro-check` proves it by building
+twice and comparing hashes. The build backend is hatchling (see
+`docs/DECISIONS.md` for why setuptools was replaced). The test suite
+runs on Python 3.11 and 3.12 (CI matrix in
+`.github/workflows/ci.yml`); coverage is gated at 85%.
 
 ## Assumptions and corrections vs. the original draft
 
@@ -164,8 +183,9 @@ with each other or with the repo. The choices made here, and why:
   cannot write `.github/workflows/ci.yml` (403, it lacks the
   `workflows` permission), so the CI file in this repo must be added
   from your own checkout or the web UI if the push of it is refused.
-  The CI itself is standard: `pytest`, `compileall`, `self-test`,
-  `doctor`, and a wheel build on Python 3.11 and 3.12.
+  The CI itself is standard: `pytest` (with coverage), `ruff`,
+  `compileall`, `self-test`, `doctor`, a reproducibility check, and
+  a wheel build on Python 3.11 and 3.12.
 
 ## Release v0.1.0 (built 2026-11-08)
 
@@ -180,10 +200,28 @@ The wheel and tarball are build artifacts, not committed to git.
 
 ## Limitations
 
-- Token parsing only understands a top-level JSON `usage` object in
-  the agent's stdout. Agents that report usage in another shape (or
-  only in stderr, or in a log file) report `tokens: null`.
+- Token parsing understands the documented shapes (Claude Code
+  `json` / `stream-json`, pi `--mode json`, pi-agent `token_usage`).
+  Agents that report usage in another shape (or only in stderr, or
+  in a log file) report `tokens: null`. No live model call is made
+  in the test suite; the real-agent fixtures reproduce the
+  documented output shapes.
+- Task input is capped at 50 MB and a run at 1800 s, both enforced.
+- Two runs to the same `--out` race on `run.json` (last writer
+  wins, each run preserved under `runs/<run_id>.json`); use a
+  distinct `--out` per concurrent run.
+- Linux only (tested); macOS is POSIX and should work but is
+  unverified; Windows is not supported (the runner needs `sh` and
+  process groups).
 - `setup.sh` / `check.sh` are run through `sh`; they must be
   POSIX-shell scripts.
 - No MCP server is included, by design: the harness uses the CLI
   through an adapter.
+
+## Documentation
+
+- `docs/DESIGN.md` -- what the tool does, run lifecycle, limits.
+- `docs/ARCHITECTURE.md` -- module map, data flow, invariants.
+- `docs/DECISIONS.md` -- why each decision was made, alternatives,
+  trade-offs, and sources. Read this first if you are changing
+  anything.

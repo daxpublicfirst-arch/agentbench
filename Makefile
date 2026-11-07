@@ -31,13 +31,15 @@ dist: clean build
 	cat dist/SHA256SUMS
 
 # Build twice into temp dirs and require byte-identical artifacts.
+# (Written without process substitution so it works under /bin/sh.)
 repro-check:
 	rm -rf /tmp/agentbench-repro-a /tmp/agentbench-repro-b
 	SOURCE_DATE_EPOCH=$(EPOCH) PYTHONHASHSEED=0 $(PYTHON) -m build --outdir /tmp/agentbench-repro-a
 	SOURCE_DATE_EPOCH=$(EPOCH) PYTHONHASHSEED=0 $(PYTHON) -m build --outdir /tmp/agentbench-repro-b
 	sha256sum /tmp/agentbench-repro-a/* /tmp/agentbench-repro-b/*
-	diff <(sha256sum /tmp/agentbench-repro-a/* | awk '{print $$1}') \
-	     <(sha256sum /tmp/agentbench-repro-b/* | awk '{print $$1}') \
+	sha256sum /tmp/agentbench-repro-a/* | awk '{print $$1}' | sort > /tmp/agentbench-repro-a.sha
+	sha256sum /tmp/agentbench-repro-b/* | awk '{print $$1}' | sort > /tmp/agentbench-repro-b.sha
+	diff /tmp/agentbench-repro-a.sha /tmp/agentbench-repro-b.sha \
 	     && echo "reproducible: wheel and sdist are byte-identical across builds"
 
 clean:
