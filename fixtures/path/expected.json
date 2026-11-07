@@ -1,0 +1,10 @@
+{
+  "with": {
+    "pass": true,
+    "tokens": null
+  },
+  "without": {
+    "pass": false,
+    "tokens": null
+  }
+}
