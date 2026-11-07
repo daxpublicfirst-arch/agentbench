@@ -151,12 +151,61 @@ def run_script(path: Path, *, cwd: Path, path_value: str, timeout_s: int) -> Com
     )
 
 
+_FIRST_TOKEN_RE = None  # built lazily to keep module import light
+
+
+def _first_token(agent_cmd: str):
+    """(start, end, unquoted) of the first token of a shell template."""
+    import re
+
+    match = re.match(r"\s*(\"[^\"]+\"|'[^']+'|[^\s]+)", agent_cmd)
+    if not match:
+        return None
+    token = match.group(1)
+    unquoted = token[1:-1] if len(token) >= 2 and token[0] in "\"'" else token
+    return match.start(1), match.end(1), unquoted
+
+
+def resolve_agent_program(agent_cmd: str) -> str:
+    """Resolve a relative agent program path against the caller's cwd.
+
+    The agent runs with cwd set to its workdir, so a relative path like
+    ``./bin/agent.sh`` would otherwise be looked up inside the workdir
+    and fail with "not found". Bare program names (no ``/``) are left
+    alone so they are still found on ``PATH``.
+    """
+    found = _first_token(agent_cmd)
+    if not found:
+        return agent_cmd
+    start, end, program = found
+    if "/" not in program or "{prompt}" in program:
+        return agent_cmd
+    path = Path(program)
+    if path.is_absolute() or not path.is_file():
+        return agent_cmd
+    absolute = (Path.cwd() / path).resolve()
+    return agent_cmd[:start] + shlex.quote(str(absolute)) + agent_cmd[end:]
+
+
+def _is_text_script(path: Path) -> bool:
+    try:
+        with path.open("rb") as handle:
+            chunk = handle.read(512)
+        return b"\x00" not in chunk
+    except OSError:
+        return False
+
+
 def run_agent(agent_cmd: str, prompt_text: str, *, cwd: Path,
               env: dict, timeout_s: int) -> CommandResult:
     """Run the external agent command in ``cwd``.
 
     If the template contains ``{prompt}`` it is replaced with the
     shell-quoted prompt text; otherwise the prompt is passed on stdin.
+    A program that is an existing file without the executable bit (for
+    example a fixture script checked out from GitHub, where the file
+    API does not preserve ``+x``) is run through ``sh`` instead of
+    failing with "permission denied".
     """
     if "{prompt}" in agent_cmd:
         cmd = agent_cmd.replace("{prompt}", shlex.quote(prompt_text))
@@ -164,6 +213,13 @@ def run_agent(agent_cmd: str, prompt_text: str, *, cwd: Path,
     else:
         cmd = agent_cmd
         stdin_text = prompt_text
+    found = _first_token(cmd)
+    if found:
+        _start, _end, program = found
+        path = Path(program)
+        if ("/" in program and path.is_file()
+                and not os.access(path, os.X_OK) and _is_text_script(path)):
+            cmd = "sh " + cmd
     return _run_process(cmd, cwd=cwd, env=env, stdin_text=stdin_text,
                         timeout_s=timeout_s)
 

@@ -187,6 +187,35 @@ def test_run_stdin_prompt_and_setup_and_files(tmp_path):
     assert (tmp_path / "out" / "without" / "1" / "work" / "seed.txt").is_file()
 
 
+def test_run_agent_relative_path(tmp_path, monkeypatch):
+    """A relative ./agent.sh is resolved against the caller's cwd,
+    not the workdir, and must actually run."""
+    task = make_task(tmp_path / "task",
+                     check="test -f agent_ran.txt\n")
+    agent = make_agent(tmp_path, body="touch agent_ran.txt\n")
+    monkeypatch.chdir(tmp_path)
+    report = run_benchmark(load_task(task), agent_cmd="./agent.sh",
+                           with_path=None, without=True, repeat=1,
+                           out_dir=tmp_path / "out")
+    assert report["runs"][0]["pass"] is True
+    assert report["runs"][0]["exit"] == 0
+
+
+def test_run_agent_non_executable_script(tmp_path):
+    """A 644 shell script as --agent runs through sh (GitHub checkouts
+    lose the +x bit on fixture scripts)."""
+    task = make_task(tmp_path / "task",
+                     check="test -f agent_ran.txt\n")
+    agent = tmp_path / "agent.sh"
+    agent.write_text("#!/bin/sh\ntouch agent_ran.txt\n")
+    agent.chmod(0o644)
+    report = run_benchmark(load_task(task), agent_cmd=str(agent),
+                           with_path=None, without=True, repeat=1,
+                           out_dir=tmp_path / "out")
+    assert report["runs"][0]["pass"] is True
+    assert report["runs"][0]["exit"] == 0
+
+
 def test_run_invalid_task_raises_task_invalid(tmp_path):
     bad = tmp_path / "bad"
     bad.mkdir()

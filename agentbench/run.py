@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 
 from . import BenchError
-from .agent import parse_tokens, run_agent, run_script
+from .agent import parse_tokens, resolve_agent_program, run_agent, run_script
 from .task import Task
 
 
@@ -188,6 +188,9 @@ def run_benchmark(task: Task, *, agent_cmd: str, with_path: str | None,
             "Run agentbench doctor to check the agent command.",
             exit_code=2,
         )
+    # Resolve a relative agent path now, while cwd is still the
+    # caller's directory (the agent later runs inside its workdir).
+    agent_cmd = resolve_agent_program(agent_cmd)
     out = Path(out_dir)
     if not out.is_absolute():
         out = (Path.cwd() / out).resolve()

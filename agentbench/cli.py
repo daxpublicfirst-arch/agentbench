@@ -183,10 +183,9 @@ def run_self_test(fixtures_dir: str | Path | None = None) -> dict:
                 results.append({"fixture": fixture.name, "ok": False,
                                 "error": "missing agent.sh"})
                 continue
-            try:
-                agent.chmod(0o755)
-            except OSError:
-                pass
+            # Do NOT chmod the fixture in place: that would mutate the
+            # user's checkout. run_agent runs a non-executable script
+            # through sh, so a 644 fixture works as checked out.
             expected: dict = {}
             if expected_path.is_file():
                 expected = json.loads(expected_path.read_text(encoding="utf-8"))
