@@ -1,0 +1,12 @@
+name = "agentbench"
+version = "0.1.0"
+kind = "cli"
+entry = "bin/agentbench"
+protocol = "arabica-plugin-v1"
+commands = ["run", "compare", "report", "self-test", "doctor", "version"]
+about = "Run one task with and without a tool, then report pass, tokens, calls and wall time."
+example = "agentbench run --task ./task --agent 'claude -p --output-format json' --with ./bin/example-tool --without --repeat 3 --out ./runs --json"
+permissions = { read = ["--task"], write = ["--out"], network = true }
+limits = { input_mb = 50, timeout_s = 1800 }
+license = "MIT"
+source = "https://github.com/daxpublicfirst-arch/agentbench"

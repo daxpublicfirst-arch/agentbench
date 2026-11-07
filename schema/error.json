@@ -1,0 +1,1 @@
+{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"error":{"properties":{"blocked":{"type":"string"},"code":{"type":"string"},"fix":{"type":"string"},"if_that_fails":{"type":"string"}},"required":["code","blocked","fix","if_that_fails"],"type":"object"},"ok":{"const":false}},"required":["ok","error"],"title":"agentbench error object","type":"object"}
