@@ -30,6 +30,23 @@ Source = "https://github.com/daxpublicfirst-arch/agentbench"
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-cov>=6", "ruff>=0.6", "build>=1"]
 
+[tool.hatch.build]
+# Defense in depth for the sdist: a virtualenv (or build output) left
+# inside the project directory must never be packaged. Hatchling
+# follows .gitignore, but an un-ignored venv (e.g. .venv312) breaks
+# the sdist build outright -- it refuses symlinks to absolute paths.
+# These excludes make the build fail-safe even then.
+exclude = [
+  "/.venv*",
+  "/venv",
+  "/dist",
+  "/build",
+  "/.pytest_cache",
+  "/.coverage",
+  "/coverage.xml",
+  "/htmlcov",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["agentbench"]
 
