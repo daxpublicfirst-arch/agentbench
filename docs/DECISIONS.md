@@ -155,27 +155,40 @@ the fixtures travel with the source -- but the sdist is larger.
 `make repro-check` builds twice and fails the build if the hashes
 differ, so a future regression is caught, not silently shipped.
 
-## 6. Python 3.11 is tested, via the deadsnakes PPA
+## 6. Python 3.11 is tested, via a standalone CPython build
 
 **Decision:** CI tests on 3.11 and 3.12. The 3.11 interpreter in
-the cloud VM is installed from the deadsnakes PPA
-(`sudo add-apt-repository ppa:deadsnakes/ppa && sudo apt install
-python3.11 python3.11-venv`), never by replacing the system
-`/usr/bin/python3`.
+the cloud VM is CPython 3.11.18 from the python-build-standalone
+project (now at astral-sh/python-build-standalone), extracted to
+`~/workspace/python311` and used only for testing. It is never
+installed over the system `/usr/bin/python3`.
 
 **Why:** the tool declares `requires-python = ">=3.11"`, so the
 lowest supported version must actually be exercised; testing only
 on 3.12 would leave 3.11 unproven. Ubuntu 24.04 ships Python 3.12,
-so 3.11 has to come from somewhere else, and deadsnakes is the
-standard source for that.
+so 3.11 has to come from somewhere else.
 
-**Trade-off (stated plainly):** deadsnakes is community-maintained
-and gives no guarantee of timely security updates. The 3.11
-interpreter here is a *test* interpreter in a throwaway VM, not a
-production runtime, and it is never used to run anything except the
-test suite. If a project's policy forbids third-party PPAs, the
-alternative is to compile CPython 3.11 from source
-(python.org) -- slower, but fully under the project's control.
+**What was tried first (and failed):** the deadsnakes PPA, the
+usual source for this (`sudo add-apt-repository ppa:deadsnakes/ppa
+&& sudo apt install python3.11 python3.11-venv`). It failed in
+this VM: `add-apt-repository` died with `PermissionError` writing
+`/etc/apt/sources.list.d/ubuntu.sources` (that file is owned by
+`nobody:nogroup`, mode 644, and the tooling here cannot overwrite
+it), leaving behind an empty `deadsnakes-ubuntu-ppa-noble.sources`.
+So the PPA route is documented here as *not* working in this
+environment, and the standalone build was used instead.
+
+**Trade-off (stated plainly):** a standalone build is a binary
+from a third party, not a distribution package. Its integrity was
+checked by the download size matching the release metadata exactly
+(30,574,046 bytes) and by gzip validity on extraction -- there was
+no separate `.sha256` asset for that release, which is a weaker
+check than a published hash and is recorded here as such. The 3.11
+interpreter is a *test* interpreter in a throwaway VM, never a
+production runtime, and it runs nothing except the test suite. If
+a project's policy forbids third-party binaries, the alternative
+is to compile CPython 3.11 from source (python.org) -- slower,
+but fully under the project's control.
 
 ## 7. Ruff + coverage gate
 
@@ -340,3 +353,25 @@ directory now aggregates both runs. That is the intended semantic
 ("everything under this `--out`"), but it means `--out` is a
 collection, not a single run -- keep one `--out` per comparison
 if that is not what you want.
+
+## 17. The sdist must never package a virtualenv
+
+**Decision:** `.gitignore` ignores `.venv*/` (not just `.venv/`),
+and `pyproject.toml` has an explicit hatchling `exclude` list for
+venvs, build output, and coverage files.
+
+**Why:** during the 0.1.1 retest, `make repro-check` failed in a
+clean clone with `ERROR 'agentbench-0.1.1/.venv312/bin/python3' is
+a link to an absolute path`. The clone's test venv (`.venv312`)
+lived inside the project directory, was not covered by
+`.gitignore`, and hatchling tried to put it in the sdist -- and
+refuses symlinks to absolute paths. A build that breaks because a
+developer happened to name their venv `.venv312` instead of
+`.venv` is a trap, not a user error.
+
+**Trade-off:** the exclude list is a second copy of the ignore
+rules. It is kept deliberately: `.gitignore` is about the working
+tree, the hatchling list is about the artifact, and the two can
+drift without either one failing loudly. The `repro-check` target
+is the backstop -- it builds from the real project directory, venv
+and all.

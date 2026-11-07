@@ -187,16 +187,23 @@ with each other or with the repo. The choices made here, and why:
   `compileall`, `self-test`, `doctor`, a reproducibility check, and
   a wheel build on Python 3.11 and 3.12.
 
-## Release v0.1.0 (built 2026-11-08)
+## Release v0.1.1 (built 2026-11-08)
 
-Built with `make dist` from the `main` head:
+Built with `make dist` from the `main` head
+`23bd6da4d9d2393cd96cb94b4b8cf0cc344bae10`
+(`SOURCE_DATE_EPOCH` = that commit's timestamp, 1794084772):
 
 ```text
-bde5b4a7bc7234969d1c5c685ca04d59a826b37f6b2d8c7e991dc761bf000b4b  agentbench-0.1.0-py3-none-any.whl
-029f593e03d40f5bb0571d7df962073e9bc66ff3f253f31457240348672ab024  agentbench-0.1.0.tar.gz
+252f50c1bab22f000d5366a5c995f1d7d4f472a6c036aa80f97dac63590333c3  agentbench-0.1.1-py3-none-any.whl
+dfe077e6c225f276bf9b025f4b361490fef135ad50bc69a4f894a65abd293b21  agentbench-0.1.1.tar.gz
 ```
 
-The wheel and tarball are build artifacts, not committed to git.
+These hashes are for the artifacts built from that head. Rebuilding
+the same head reproduces them exactly (`make repro-check` proves it,
+and `sha256sum -c dist/SHA256SUMS` verifies a build). The wheel and
+tarball are build artifacts, not committed to git. (Hashes cannot be
+recorded inside the source they describe -- changing this file
+changes the build -- so they are recorded here per head, as above.)
 
 ## Limitations
 
